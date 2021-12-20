@@ -26,6 +26,7 @@ use sqlx::{pool::PoolConnection, sqlite::SqlitePool, Sqlite};
 pub struct SqliteSessionStore {
     client: SqlitePool,
     table_name: String,
+    cache: SessionCache,
 }
 
 impl SqliteSessionStore {
@@ -48,6 +49,7 @@ impl SqliteSessionStore {
         Self {
             client,
             table_name: "async_sessions".into(),
+            cache: SessionCache::new(100),
         }
     }
 
@@ -240,6 +242,10 @@ impl SqliteSessionStore {
         .bind(Utc::now().timestamp())
         .execute(&mut connection)
         .await?;
+        // xxx invalidate stale cache
+        // self.cache
+        //     .invalidate(&self.session.id().to_owned())
+        //     .await;
 
         Ok(())
     }
@@ -274,6 +280,11 @@ impl SqliteSessionStore {
 impl SessionStore for SqliteSessionStore {
     async fn load_session(&self, cookie_value: String) -> Result<Option<Session>> {
         let id = Session::id_from_cookie_value(&cookie_value)?;
+
+        if let Some(session) = self.cache.get(&id) {
+            return Ok(Some(session));
+        }
+
         let mut connection = self.connection().await?;
 
         let result: Option<(String,)> = sqlx::query_as(&self.substitute_table_name(
@@ -312,6 +323,8 @@ impl SessionStore for SqliteSessionStore {
         .execute(&mut connection)
         .await?;
 
+        self.cache.insert(id.to_owned(), session.to_owned()).await;
+
         Ok(session.into_cookie_value())
     }
 
@@ -327,6 +340,8 @@ impl SessionStore for SqliteSessionStore {
         .execute(&mut connection)
         .await?;
 
+        self.cache.invalidate(&id.to_owned()).await;
+
         Ok(())
     }
 
@@ -339,6 +354,8 @@ impl SessionStore for SqliteSessionStore {
         ))
         .execute(&mut connection)
         .await?;
+
+        self.cache.invalidate_all();
 
         Ok(())
     }
@@ -511,5 +528,43 @@ mod tests {
         assert_eq!(0, store.count().await?);
 
         Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct SessionCache(moka::future::Cache<String, Session>);
+impl SessionCache {
+    fn new(size: usize) -> Self {
+        Self(
+            moka::future::CacheBuilder::new(size)
+                .time_to_idle(std::time::Duration::from_secs(5 * 60))
+                .build(),
+        )
+    }
+}
+
+impl std::ops::Deref for SessionCache {
+    type Target = moka::future::Cache<String, Session>;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl AsRef<moka::future::Cache<String, Session>> for SessionCache {
+    #[inline]
+    fn as_ref(&self) -> &moka::future::Cache<String, Session> {
+        &self.0
+    }
+}
+impl std::fmt::Debug for SessionCache {
+    #[inline]
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
+        write!(
+            fmt,
+            "SessionCache {{ num_segments: {}, time_to_live: {:?}, time_to_idle: {:?} }}",
+            self.num_segments(),
+            self.time_to_live(),
+            self.time_to_idle(),
+        )
     }
 }
